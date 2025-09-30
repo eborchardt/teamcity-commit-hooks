@@ -132,6 +132,44 @@ class WebhookPeriodicalChecker(
         while (toCheck.isNotEmpty()) {
             val pair = toCheck.pop()
             val (info, hook) = pair
+            if (TeamCityProperties.getBoolean("teamcity.githubWebhooks.removeOrphanWebhooks", false)) {
+                // Before doing any token/user/GH calls, verify there is still a matching VCS root
+                val hasAnyMatchingRoot: Boolean = run {
+                    var found = false
+                    // Traverse all suitable git roots across the whole server
+                    Util.findSuitableRoots(myProjectManager.rootProject, recursive = true, archived = false) { root ->
+                        val rInfo = Util.getGitHubInfo(root) ?: return@findSuitableRoots true
+                        if (rInfo == info) {
+                            found = true
+                            return@findSuitableRoots false // stop traversal
+                        }
+                        true
+                    }
+                    found
+                }
+                if (!hasAnyMatchingRoot) {
+                    // Orphan webhook: no corresponding VCS root exists in TeamCity
+                    LOG.info("No TeamCity VCS roots found for repository '${info.id}'. Removing webhook '${hook.url}' from storage")
+
+                    // Remove from webhook storage
+                    myWebHooksStorage.delete(hook)
+
+                    // Remove auth-data for this repo + hook if we can resolve the pubKey
+                    GitHubWebHookListener.getPubKeyFromRequestPath(hook.callbackUrl)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { pubKey ->
+                            myAuthDataStorage.remove(
+                                myAuthDataStorage.findAllForRepository(info).filter { it.public == pubKey }
+                            )
+                        }
+
+                    // Skip further processing for this orphaned webhook
+                    continue
+                }
+            } else {
+                LOG.debug("Would remove orphan webhook for '${info.id}', but removal is disabled. Enable removal by adding " +
+                          "'teamcity.githubWebhooks.removeOrphanWebhooks=true' to TeamCity Server Internal Properties")
+            }
             val callbackUrl = hook.callbackUrl
             val pubKey = GitHubWebHookListener.getPubKeyFromRequestPath(callbackUrl)
             if (pubKey == null || pubKey.isBlank()) {
